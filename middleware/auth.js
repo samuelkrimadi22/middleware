@@ -1,0 +1,226 @@
+require('dotenv').config();
+const jwt = require('jsonwebtoken');
+const { dbGet } = require('../database/db');
+
+// V8.9.5: User cache — kurangi beban DB saat frontend polling
+const _userCache = new Map();
+const USER_CACHE_TTL_MS = 30000; // 30 detik
+
+// Bersihkan cache lama setiap 2 menit
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, val] of _userCache.entries()) {
+        if (now - val.ts > USER_CACHE_TTL_MS * 2) _userCache.delete(key);
+    }
+}, 120000);
+
+// ============================================================
+// V8.7.0 SECURITY: JWT_SECRET wajib dari .env, tidak ada fallback
+// ============================================================
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    console.error('❌ FATAL: JWT_SECRET tidak di-set atau terlalu pendek di .env!');
+    console.error('   Cek file .env, pastikan ada JWT_SECRET=<min-32-karakter>');
+    process.exit(1);
+}
+
+
+
+/**
+ * Middleware: verifikasi JWT token di header Authorization
+ * Format: "Bearer <token>"
+ */
+async function requireAuth(req, res, next) {
+    // 1. Coba dari header Authorization DULU (untuk API/mobile)
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.substring(7);
+    }
+
+    // 2. Kalau tidak ada di header, coba dari cookie (untuk web browser)
+    if (!token && req.cookies) {
+        token = req.cookies.clipora_token
+              || req.cookies.auth_token
+              || req.cookies.token
+              || req.cookies.jwt
+              || null;
+        if (token) {
+            console.log('[Auth] Token dari cookie OK');
+        }
+    }
+
+    // 3. Kalau masih tidak ada, coba dari query/body (fallback)
+    if (!token && req.query && req.query.token) {
+        token = req.query.token;
+    }
+
+    // 4. Validasi token ada
+    if (!token) {
+        return res.status(401).json({ success: false, error: 'Token tidak disediakan', code: 'NO_TOKEN' });
+    }
+
+    // 2. Verify JWT — error JWT memang 401
+    let decoded;
+    let userId;  // V9.128.7: FIX USERID SCOPE - declare di function scope
+    try {
+        decoded = jwt.verify(token, JWT_SECRET);
+        
+        // V9.128.6: UNIVERSAL AUTH - extract userId dari berbagai format
+        userId = decoded.userId
+                    || decoded.user_id
+                    || decoded.id
+                    || decoded.sub
+                    || decoded.uid;
+        
+        if (!userId) {
+            console.error("[Auth] Token payload invalid. Keys:", Object.keys(decoded));
+            return res.status(401).json({ success: false, error: "Token payload invalid", code: "INVALID_PAYLOAD", debug_keys: Object.keys(decoded) });
+        }
+    } catch (err) {
+        if (err.name === 'TokenExpiredError') {
+            return res.status(401).json({ success: false, error: 'Token kadaluarsa', code: 'TOKEN_EXPIRED' });
+        }
+        return res.status(401).json({ success: false, error: 'Token tidak valid', code: 'TOKEN_INVALID' });
+    }
+
+    // 3. V8.9.5: Cek cache dulu — hindari hit DB setiap request
+    const now = Date.now();
+    const cached = _userCache.get(userId);
+    if (cached && (now - cached.ts) < USER_CACHE_TTL_MS) {
+        req.user = cached.user;
+        return next();
+    }
+
+    // 4. DB lookup — error DB BUKAN 401
+    let user;
+    try {
+        user = await dbGet(
+            'SELECT id, email, username, full_name, plan, daily_quota, is_admin FROM users WHERE id = ?',
+            [userId]
+        );
+    } catch (dbErr) {
+        console.error('[Auth] DB error di requireAuth:', dbErr.message);
+        return res.status(503).json({
+            success: false,
+            error: 'Server sedang sibuk, coba lagi sebentar',
+            code: 'DB_BUSY'
+        });
+    }
+
+    if (!user) {
+        return res.status(401).json({ success: false, error: 'User tidak ditemukan', code: 'USER_NOT_FOUND' });
+    }
+
+    // 5. Simpan ke cache
+    _userCache.set(userId, { user, ts: now });
+
+    req.user = user;
+    next();
+}
+
+/**
+ * Middleware opsional: verifikasi token TAPI tidak block jika tidak ada
+ * Berguna untuk endpoint yang bisa diakses guest & login user
+ */
+async function optionalAuth(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            req.user = null;
+            return next();
+        }
+
+        const token = authHeader.substring(7);
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // V9.128.6: UNIVERSAL AUTH - extract userId dari berbagai format
+        const userId = decoded.userId
+                    || decoded.user_id
+                    || decoded.id
+                    || decoded.sub
+                    || decoded.uid;
+        
+        if (!userId) {
+            console.error("[Auth] Token payload invalid. Keys:", Object.keys(decoded));
+            return res.status(401).json({ success: false, error: "Token payload invalid", code: "INVALID_PAYLOAD", debug_keys: Object.keys(decoded) });
+        }
+        const user = await dbGet('SELECT id, email, username, plan, daily_quota, is_admin FROM users WHERE id = ?', [userId]);
+        req.user = user || null;
+    } catch (e) {
+        req.user = null;
+    }
+    next();
+}
+
+/**
+ * Middleware: verifikasi API Key
+ * Format: header "X-API-Key: <key>"
+ */
+async function requireApiKey(req, res, next) {
+    try {
+        const apiKey = req.headers['x-api-key'];
+        if (!apiKey) {
+            return res.status(401).json({ success: false, error: 'API Key tidak disediakan' });
+        }
+
+        const keyData = await dbGet(`
+            SELECT ak.*, u.id as user_id, u.email, u.username, u.plan, u.daily_quota, u.is_admin
+            FROM api_keys ak
+            JOIN users u ON ak.user_id = u.id
+            WHERE ak.api_key = ? AND ak.is_active = 1
+        `, [apiKey]);
+
+        if (!keyData) {
+            return res.status(401).json({ success: false, error: 'API Key tidak valid' });
+        }
+
+        // Update usage
+        const { dbRun } = require('../database/db');
+        await dbRun('UPDATE api_keys SET last_used = CURRENT_TIMESTAMP, usage_count = usage_count + 1 WHERE id = ?', [keyData.id]);
+
+        req.user = {
+            id: keyData.user_id,
+            email: keyData.email,
+            username: keyData.username,
+            plan: keyData.plan,
+            daily_quota: keyData.daily_quota,
+            is_admin: keyData.is_admin
+        };
+        req.apiKeyId = keyData.id;
+        next();
+    } catch (error) {
+        return res.status(401).json({ success: false, error: 'API Key error' });
+    }
+}
+
+/**
+ * Middleware: verifikasi admin
+ */
+function requireAdmin(req, res, next) {
+    if (!req.user || !req.user.is_admin) {
+        return res.status(403).json({ success: false, error: 'Akses ditolak. Admin only.' });
+    }
+    next();
+}
+
+/**
+ * Generate JWT token untuk user
+ */
+function generateToken(user) {
+    return jwt.sign(
+        { 
+            userId: user.id, 
+            email: user.email, 
+            username: user.username,
+            // ⭐ V9.6.0 SECURITY: is_admin di JWT (signed, tidak bisa dipalsukan)
+            is_admin: user.is_admin ? 1 : 0
+        },
+        JWT_SECRET,
+        { expiresIn: user.is_admin
+            ? '365d'
+            : (process.env.JWT_EXPIRES_IN || '7d') }
+    );
+}
+
+module.exports = { requireAuth, optionalAuth, requireApiKey, requireAdmin, generateToken, JWT_SECRET };
